@@ -1258,7 +1258,7 @@ fn bind_listener_candidate(
     }
 
     let mut candidate = port;
-    let max_port = port.saturating_add(1000).min(65535);
+    let max_port = port.saturating_add(1000);
 
     while candidate <= max_port {
         if avoid_ports.contains(&candidate) {
