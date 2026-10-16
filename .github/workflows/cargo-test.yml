@@ -72,6 +72,11 @@ jobs:
         working-directory: engine
         run: |
           set -euo pipefail
+          if [ ! -f ./target/release/xerj ] || [ ! -f ./target/release/es-yaml-runner ]; then
+            echo "Building xerj-server and es-yaml-runner..."
+            cargo build --release -p xerj-server -p es-yaml-runner
+          fi
+
           DATA="$(mktemp -d)"
           echo "Booting xerj server with data dir $DATA..."
           ./target/release/xerj --insecure --data-dir "$DATA" > "$DATA/server.log" 2>&1 &
