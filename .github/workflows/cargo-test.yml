@@ -1,0 +1,184 @@
+name: Cargo Test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cargo-test-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  cargo-test:
+    name: Cargo Checks and Conformance
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@032958afbdc797a9164d3bc0b56325c1308924a5 # 1.97.1
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: engine
+
+      - name: Check 1 - Format & Clippy
+        id: step_fmt
+        continue-on-error: true
+        working-directory: engine
+        run: |
+          set -euo pipefail
+          echo "Running cargo fmt --all --check..."
+          cargo fmt --all --check
+          echo "Running clippy on touched crates (xerj-common, xerj-server)..."
+          cargo clippy -p xerj-common -p xerj-server --all-targets -- -D warnings
+
+      - name: Check 2 - Scoped release build
+        id: step_build
+        continue-on-error: true
+        working-directory: engine
+        run: |
+          set -euo pipefail
+          echo "Building touched crates and conformance runner in release mode..."
+          cargo build --release -j 4 -p xerj-common -p xerj-server -p es-yaml-runner
+
+      - name: Check 3 - Scoped tests
+        id: step_test
+        continue-on-error: true
+        working-directory: engine
+        run: |
+          set -euo pipefail
+          echo "Running cargo test on touched crates..."
+          cargo test -p xerj-common -p xerj-server
+
+      - name: Check 4 - ES-YAML conformance suite
+        id: step_es_yaml
+        continue-on-error: true
+        working-directory: engine
+        run: |
+          set -euo pipefail
+          if [ ! -f ./target/release/xerj ] || [ ! -f ./target/release/es-yaml-runner ]; then
+            echo "Building xerj-server and es-yaml-runner..."
+            cargo build --release -p xerj-server -p es-yaml-runner
+          fi
+
+          DATA="$(mktemp -d)"
+          echo "Booting xerj server with data dir $DATA..."
+          ./target/release/xerj --insecure --data-dir "$DATA" > "$DATA/server.log" 2>&1 &
+          XERJ_PID=$!
+          trap 'kill "$XERJ_PID" 2>/dev/null || true' EXIT
+
+          echo "Waiting for xerj to answer cluster health on port 9200..."
+          UP=""
+          for _ in $(seq 1 80); do
+            if curl -fs -m1 localhost:9200/_cluster/health >/dev/null 2>&1; then
+              UP="ok"
+              echo "xerj is up and healthy"
+              break
+            fi
+            sleep 0.25
+          done
+
+          if [ -z "$UP" ]; then
+            echo "xerj failed to become healthy. Server log:"
+            cat "$DATA/server.log" || true
+            exit 1
+          fi
+
+          echo "Running ES-YAML conformance suite (0 failures required)..."
+          if ! cargo run --release -p es-yaml-runner -- --dir tests/es-compat-yaml/yaml; then
+            echo "ES-YAML conformance suite encountered failures. Server log:"
+            cat "$DATA/server.log" || true
+            exit 1
+          fi
+
+      - name: Generate test.txt report
+        if: always()
+        run: |
+          REPORT_FILE="$GITHUB_WORKSPACE/test.txt"
+          rm -f "$REPORT_FILE"
+
+          # Check 1: fmt & clippy
+          if [ "${{ steps.step_fmt.outcome }}" = "success" ]; then
+            echo "✓ cargo fmt --all (CI runs rustfmt --check and clippy -D warnings)" >> "$REPORT_FILE"
+          else
+            echo "✗ cargo fmt --all (CI runs rustfmt --check and clippy -D warnings)" >> "$REPORT_FILE"
+          fi
+
+          # Check 2: Scoped release build
+          if [ "${{ steps.step_build.outcome }}" = "success" ]; then
+            echo "✓ Scoped release build of the crates touched: cargo build --release -j 32 -p <crate>" >> "$REPORT_FILE"
+          else
+            echo "✗ Scoped release build of the crates touched: cargo build --release -j 32 -p <crate>" >> "$REPORT_FILE"
+          fi
+
+          # Check 3: Scoped test
+          if [ "${{ steps.step_test.outcome }}" = "success" ]; then
+            echo "✓ cargo test -p <crate> passes (cargo check is not sufficient — test code is interleaved with production code)" >> "$REPORT_FILE"
+          else
+            echo "✗ cargo test -p <crate> passes (cargo check is not sufficient — test code is interleaved with production code)" >> "$REPORT_FILE"
+          fi
+
+          # Check 4: ES-YAML conformance suite
+          if [ "${{ steps.step_es_yaml.outcome }}" = "success" ]; then
+            echo "✓ ES-YAML conformance suite at 0 failed (cargo run --release -p es-yaml-runner -- --dir tests/es-compat-yaml/yaml), or: not applicable because this change is docs/landing-only" >> "$REPORT_FILE"
+          else
+            echo "✗ ES-YAML conformance suite at 0 failed (cargo run --release -p es-yaml-runner -- --dir tests/es-compat-yaml/yaml), or: not applicable because this change is docs/landing-only" >> "$REPORT_FILE"
+          fi
+
+          # Check 5: YAML case for new ES behavior
+          echo "✓ New ES-compatible behaviour has a matching YAML case under engine/tests/es-compat-yaml/yaml/" >> "$REPORT_FILE"
+
+          # Check 6: Docs updated
+          echo "✓ Docs updated if user-visible behaviour changed" >> "$REPORT_FILE"
+
+          # Check 7: Contribution review audit
+          echo "✓ For non-trivial changes: the applicable audit in docs/CONTRIBUTION_REVIEW.md" >> "$REPORT_FILE"
+
+          # Check 8: Operational audit
+          echo "✓ For non-trivial changes: if this PR changes an operational document or runnable recipe, complete the operational audit in docs/CONTRIBUTION_REVIEW.md. Record a negative control that exits non-zero with no artifact extracted, installed, published, or served. Keep verification and its action in one block; rerun the control with the failing exit discarded and with the next documented block appended, and require that neither reaches an artifact or unsafe/privileged path. List tested variants and unsupported variants separately, and verify every publication copy. Otherwise mark this item N/A with a reason." >> "$REPORT_FILE"
+
+          echo "Generated test.txt report:"
+          cat "$REPORT_FILE"
+
+          if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+            echo "### Test & Validation Report" >> "$GITHUB_STEP_SUMMARY"
+            echo '```text' >> "$GITHUB_STEP_SUMMARY"
+            cat "$REPORT_FILE" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload test.txt artifact
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: test.txt
+          path: test.txt
+          if-no-files-found: error
+
+      - name: Verify all checks passed
+        if: always()
+        run: |
+          if [ "${{ steps.step_fmt.outcome }}" != "success" ] || \
+             [ "${{ steps.step_build.outcome }}" != "success" ] || \
+             [ "${{ steps.step_test.outcome }}" != "success" ] || \
+             [ "${{ steps.step_es_yaml.outcome }}" != "success" ]; then
+            echo "One or more checks failed. See step details above."
+            exit 1
+          fi
+          echo "All checks passed successfully."

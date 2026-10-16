@@ -1258,7 +1258,7 @@ fn bind_listener_candidate(
     }
 
     let mut candidate = port;
-    let max_port = port.saturating_add(1000).min(65535);
+    let max_port = port.saturating_add(1000);
 
     while candidate <= max_port {
         if avoid_ports.contains(&candidate) {
@@ -1481,6 +1481,7 @@ async fn run_cli_index(cmd: IndexCmdArgs) -> Result<()> {
         config: cmd.config.clone(),
         // No listener is bound for in-process indexing, so no port applies.
         port: None,
+        auto_port: None,
         data_dir: cmd.data_dir.clone(),
         // In-process CLI indexing binds no listener at all, so the bind
         // address is irrelevant here — take whatever the config says.
